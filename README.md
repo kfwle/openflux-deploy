@@ -13,9 +13,11 @@ Debian/Ubuntu or AlmaLinux/RHEL-family VPS.
 Run it **directly on the target VPS**, as root:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/wlruscfd/openflux-deploy/main/install.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/install.sh | sudo bash
 ```
+```bash
 
+```
 (Not orchestrated remotely over SSH from your own machine - simpler and more robust to just run it
 where it's actually provisioning things.)
 
