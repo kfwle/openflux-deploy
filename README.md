@@ -18,7 +18,7 @@ curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/install.
 For uninstall run it:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/usinstall.sh | sudo bash
+curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/uninstall.sh | sudo bash
 ```
 (Not orchestrated remotely over SSH from your own machine - simpler and more robust to just run it
 where it's actually provisioning things.)
