@@ -1,7 +1,7 @@
 #!/bin/bash
 # OpenFlux control-plane auto-deployer - run as root on the target VPS: curl -fsSL .../install.sh -o install.sh && sudo bash install.sh
 set -Eeuo pipefail
-
+# великий кфвл починил скрипт
 GO_VERSION="1.26.5"
 INSTALL_ROOT="/opt/openflux"
 BIN_DIR="$INSTALL_ROOT/bin"
@@ -20,6 +20,39 @@ DEFAULT_REPO_URL="https://github.com/wlruscfd/openflux-server.git"
 log()  { printf '\n==> %s\n' "$*"; }
 warn() { printf '!! %s\n' "$*" >&2; }
 die()  { printf 'ERROR: %s\n' "$*" >&2; exit 1; }
+
+# Quiet-by-default progress UI: long noisy phases show only a "[ xx%] label" line
+# and append tool output to $LOG_FILE. Set VERBOSE=1 to see everything live:
+#   curl ... -o install.sh && sudo VERBOSE=1 bash install.sh
+LOG_FILE="${LOG_FILE:-/var/log/openflux-install.log}"
+VERBOSE="${VERBOSE:-0}"
+STEP=0
+TOTAL_STEPS=10
+step() {
+    STEP=$((STEP+1))
+    printf '\n==> [%3d%%] %s\n' "$((STEP*100/TOTAL_STEPS))" "$*"
+}
+qrun() {
+    # qrun cmd args... - run quietly into $LOG_FILE unless VERBOSE=1.
+    if [ "${VERBOSE:-0}" = "1" ]; then "$@"; return $?; fi
+    "$@" >>"$LOG_FILE" 2>&1
+}
+qtail() { tail -n 25 "$LOG_FILE" 2>/dev/null || true; }
+
+# Browsers refuse HTTP(S) on ports normally used by other protocols - Firefox shows
+# "This address uses a network port which is normally used for purposes other than
+# Web browsing", Chrome shows ERR_UNSAFE_PORT - and no server-side setting can
+# override that, so the panel must never land on one of them. Union of Firefox's
+# network.security.ports.banned and Chromium's kRestrictedPorts.
+is_browser_blocked_port() {
+    case "${1:-}" in
+        1|7|9|11|13|15|17|19|20|21|22|23|25|37|42|43|53|69|77|79|87|95|101|102|103|104|\
+109|110|111|113|115|117|119|123|135|139|143|179|389|427|465|512|513|514|515|526|530|\
+531|532|540|548|554|556|563|587|601|636|989|990|993|995|2049|3659|4045|6000|6665|6666|\
+6667|6668|6669) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 apt_sources_without_ubuntu() {
     local fallback file
@@ -42,12 +75,12 @@ apt_drop_stale_ubuntu_lists() {
 
 apt_update_with_fallback() {
     local fallback
-    if apt-get update -y; then
+    if qrun apt-get update -y; then
         return 0
     fi
     warn "apt update failed; retrying without unavailable Ubuntu repositories"
     fallback="$(apt_sources_without_ubuntu)"
-    if apt-get update -y \
+    if qrun apt-get update -y \
         -o "Dir::Etc::sourcelist=$fallback" \
         -o "Dir::Etc::sourceparts=-" \
         -o "APT::Get::List-Cleanup=0"; then
@@ -58,7 +91,7 @@ apt_update_with_fallback() {
     apt_drop_stale_ubuntu_lists
     rm -f "$fallback"
     warn "apt update still failed; retrying with cached package indexes only"
-    apt-get update -y \
+    qrun apt-get update -y \
         -o "Dir::Etc::sourcelist=/dev/null" \
         -o "Dir::Etc::sourceparts=-" \
         -o "APT::Get::List-Cleanup=0" >/dev/null 2>&1 || warn "apt cache refresh failed; using existing package indexes"
@@ -66,17 +99,20 @@ apt_update_with_fallback() {
 }
 
 apt_install_with_fallback() {
-    if apt-get install -y "$@"; then
+    if qrun apt-get install -y "$@"; then
         return 0
     fi
     warn "apt install failed; retrying without downloading packages"
-    apt-get install -y --no-download "$@" ||
+    qrun apt-get install -y --no-download "$@" ||
         die "apt package installation failed: $*"
 }
 
-trap 'printf "ERROR: install.sh failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2' ERR
+trap 'printf "ERROR: install.sh failed at line %s: %s\n" "$LINENO" "$BASH_COMMAND" >&2; qtail >&2' ERR
 
 [ "$(id -u)" -eq 0 ] || die "Run this as root (sudo bash install.sh)."
+
+mkdir -p "$(dirname "$LOG_FILE")"
+: >>"$LOG_FILE" 2>/dev/null || true
 
 # HAVE_TTY: checked once, up front, instead of per-prompt - a non-pty SSH exec (the app's automated
 # deploy) has no controlling terminal at all, so every open of /dev/tty below would otherwise still
@@ -198,7 +234,7 @@ if [ "$TLS_MODE" = "domain" ]; then
     ask LE_EMAIL "Email for Let's Encrypt account/renewal notices" ""
     [ -n "$LE_EMAIL" ] || die "An email is required for Let's Encrypt registration."
     SERVER_NAME="$DOMAIN"
-    ask HTTPS_PORT "HTTPS port for the panel (change only if 443 is already used by something else on this server)" "443"
+    ask HTTPS_PORT "HTTPS port for the panel (443, or 8443 if 443 is taken)" "443"
 elif [ "$TLS_MODE" = "http" ]; then
     DETECTED_IP="$(detect_public_ip)"
     ask SERVER_IP "Public IP of this server" "$DETECTED_IP"
@@ -215,9 +251,31 @@ else
     ask SERVER_IP "Public IP of this server" "$DETECTED_IP"
     [ -n "$SERVER_IP" ] || die "Could not detect the public IP automatically - enter it manually."
     SERVER_NAME="$SERVER_IP"
-    ask HTTPS_PORT "HTTPS port for the panel (change only if 443 is already used by something else on this server)" "443"
+    ask HTTPS_PORT "HTTPS port for the panel (443, or 8443 if 443 is taken)" "443"
 fi
 HTTPS_PORT="${HTTPS_PORT:-443}"
+# A typo'd or "secure-looking" port here (993, 995, 587, ...) produces a server
+# that is up but that no browser will open - re-ask until the port is valid and
+# not on the browsers' blocked list instead of deploying something unreachable.
+while :; do
+    case "$HTTPS_PORT" in ''|*[!0-9]*) HTTPS_PORT="" ;; esac
+    if [ -z "$HTTPS_PORT" ]; then
+        ask HTTPS_PORT "HTTPS port for the panel (443, or 8443 if 443 is taken)" "8443"
+        HTTPS_PORT="${HTTPS_PORT:-8443}"
+        continue
+    fi
+    if [ "$HTTPS_PORT" -lt 1 ] || [ "$HTTPS_PORT" -gt 65535 ]; then
+        warn "\"$HTTPS_PORT\" is not a valid TCP port (1-65535)."
+        HTTPS_PORT=""
+        continue
+    fi
+    if is_browser_blocked_port "$HTTPS_PORT"; then
+        warn "Port $HTTPS_PORT is blocked by Firefox/Chrome for websites - browsers will refuse to open the panel on it. Use 443 or 8443."
+        HTTPS_PORT=""
+        continue
+    fi
+    break
+done
 
 if [ "$TLS_MODE" != "http" ]; then
     ask RESERVE_PORT_80 "Reserve port 80 for another service on this machine? Skips Let's Encrypt entirely (self-signed cert on \$HTTPS_PORT only, no auto-renewal) (y/n)" "n"
@@ -257,65 +315,39 @@ if [ "$REGISTER_NODE" = "y" ] || [ "$REGISTER_NODE" = "Y" ]; then
     ask NODE_NAME "First node's name" "node-1"
     ask NODE_MAX_KEYS "First node's max keys (999999 = no real limit)" "999999"
     ask RUN_NODE_HERE "Also run this exit node on this same server? (y/n)" "y"
-    if [ "$RUN_NODE_HERE" = "y" ] || [ "$RUN_NODE_HERE" = "Y" ]; then
-        DEFAULT_HEADLESS_CAPTCHA="n"
-        [ "$(read_existing_env NODEAGENT_CAPTCHA_SOLVE_MODE "$NODEAGENT_ENV_FILE")" = "headless_browser" ] && DEFAULT_HEADLESS_CAPTCHA="y"
-        ask ENABLE_HEADLESS_CAPTCHA "Also try a headless browser to auto-solve any Yandex CAPTCHA that still gets through? Installs Chromium (~150-200MB extra RAM only while actually solving one, idle otherwise) (y/n)" "$DEFAULT_HEADLESS_CAPTCHA"
-    fi
 fi
 
 if [ "$OS_FAMILY" = "debian" ]; then
     export DEBIAN_FRONTEND=noninteractive
+    step "Updating package indexes"
     apt_update_with_fallback
     if [ "$TLS_MODE" = "http" ]; then
-        log "Installing packages (git, postgresql)"
+        step "Installing system packages (git, postgresql)"
         apt_install_with_fallback git curl postgresql postgresql-contrib openssl unzip
     else
-        log "Installing packages (git, postgresql, nginx, snapd)"
+        step "Installing system packages (git, postgresql, nginx, snapd)"
         apt_install_with_fallback git curl postgresql postgresql-contrib nginx snapd openssl unzip
     fi
 else
+    step "Installing system packages"
     if [ "$TLS_MODE" = "http" ]; then
-        log "Installing packages (git, postgresql)"
-        dnf install -y git curl postgresql-server postgresql postgresql-contrib openssl iptables-nft unzip
+        qrun dnf install -y git curl postgresql-server postgresql postgresql-contrib openssl iptables-nft unzip
     else
-        log "Installing packages (git, postgresql, nginx, snapd)"
-        dnf install -y epel-release
-        dnf install -y git curl postgresql-server postgresql postgresql-contrib nginx snapd openssl iptables-nft unzip policycoreutils-python-utils
-        systemctl enable --now snapd.socket
+        qrun dnf install -y epel-release
+        qrun dnf install -y git curl postgresql-server postgresql postgresql-contrib nginx snapd openssl iptables-nft unzip policycoreutils-python-utils
+        qrun systemctl enable --now snapd.socket
         ln -sf /var/lib/snapd/snap /snap
     fi
 fi
 
-if [ "${ENABLE_HEADLESS_CAPTCHA:-n}" = "y" ] || [ "${ENABLE_HEADLESS_CAPTCHA:-n}" = "Y" ]; then
-    log "Installing a headless-capable Chrome (unattended CAPTCHA-solving for the exit node - non-fatal if it fails)"
-    # Google Chrome's own .deb, not apt's "chromium" (a snap stub on modern Ubuntu) - snap confinement wants a real per-user home dir and a systemd user session, neither of which a headless service account like $SYSTEM_USER has.
-    if [ "$OS_FAMILY" = "debian" ]; then
-        command -v gpg >/dev/null 2>&1 || apt-get install -y gnupg >/dev/null 2>&1 || true
-        if command -v gpg >/dev/null 2>&1; then
-            install -d -m 0755 /usr/share/keyrings
-            if curl -fsSL https://dl.google.com/linux/linux_signing_key.pub | gpg --dearmor -o /usr/share/keyrings/google-chrome.gpg 2>/dev/null; then
-                echo "deb [arch=amd64 signed-by=/usr/share/keyrings/google-chrome.gpg] http://dl.google.com/linux/chrome/deb/ stable main" > /etc/apt/sources.list.d/google-chrome.list
-                apt-get update -y || rm -f /etc/apt/sources.list.d/google-chrome.list
-            fi
-        fi
-        apt-get install -y google-chrome-stable || apt-get install -y chromium || apt-get install -y chromium-browser || warn "Headless Chrome install failed - the exit node will still work, just without automatic CAPTCHA solving."
-    else
-        dnf install -y google-chrome-stable || { dnf install -y epel-release 2>/dev/null; dnf install -y chromium; } || warn "Headless Chrome install failed - the exit node will still work, just without automatic CAPTCHA solving."
-    fi
-    # Recent Ubuntu kernels block unprivileged user namespaces via AppArmor by default, which makes a sandboxed browser fail with "cannot change profile for the next exec call" even under --no-sandbox. Key may not exist on other distros/kernels - failing here must not be fatal.
-    echo 'kernel.apparmor_restrict_unprivileged_userns=0' > /etc/sysctl.d/60-openflux-chromium.conf 2>/dev/null
-    sysctl --system >/dev/null 2>&1 || true
-fi
-
 if [ "$TLS_MODE" != "http" ] && [ "${RESERVE_PORT_80:-n}" != "y" ] && [ "${RESERVE_PORT_80:-n}" != "Y" ]; then
     # Distro-packaged certbot is too old for IP-address certs (needs 5.3+) - certbot's own snap stays current.
-    log "Installing certbot via snap"
+    step "Installing certbot via snap"
     if command -v snap >/dev/null 2>&1 &&
-        snap wait system seed.loaded 2>/dev/null &&
-        { snap install core >/dev/null 2>&1 || true; } &&
-        { snap refresh core >/dev/null 2>&1 || true; } &&
-        snap install --classic certbot; then
+        qrun snap wait system seed.loaded 2>/dev/null &&
+        { qrun snap install core || true; } &&
+        { qrun snap refresh core || true; } &&
+        qrun snap install --classic certbot; then
         ln -sf /snap/bin/certbot /usr/bin/certbot
     else
         warn "Could not install certbot via snap (snap may not be usable on this host)."
@@ -323,7 +355,7 @@ if [ "$TLS_MODE" != "http" ] && [ "${RESERVE_PORT_80:-n}" != "y" ] && [ "${RESER
     fi
 fi
 
-log "Installing Go $GO_VERSION (apt's Go is usually too old for this project)"
+step "Installing Go $GO_VERSION (apt's Go is usually too old for this project)"
 if ! command -v /usr/local/go/bin/go >/dev/null 2>&1 || \
    ! /usr/local/go/bin/go version | grep -q "go$GO_VERSION"; then
     if command -v dpkg >/dev/null 2>&1; then
@@ -350,32 +382,31 @@ if ! command -v /usr/local/go/bin/go >/dev/null 2>&1 || \
 fi
 export PATH="/usr/local/go/bin:$PATH"
 
-log "Fetching openflux-server ($GIT_REF)"
+step "Fetching openflux-server ($GIT_REF)"
 # Needed once $SRC_DIR is owned by $SYSTEM_USER (see chown below) - git refuses a repo it doesn't own otherwise.
 git config --global --get-all safe.directory 2>/dev/null | grep -qxF "$SRC_DIR" ||
     git config --global --add safe.directory "$SRC_DIR"
 if [ -d "$SRC_DIR/.git" ]; then
-    git -C "$SRC_DIR" fetch --depth 1 origin "$GIT_REF"
-    git -C "$SRC_DIR" checkout "$GIT_REF"
-    git -C "$SRC_DIR" reset --hard "origin/$GIT_REF"
+    qrun git -C "$SRC_DIR" fetch --depth 1 origin "$GIT_REF"
+    qrun git -C "$SRC_DIR" checkout "$GIT_REF"
+    qrun git -C "$SRC_DIR" reset --hard "origin/$GIT_REF"
 else
     mkdir -p "$INSTALL_ROOT"
-    git clone --branch "$GIT_REF" --depth 1 "$REPO_URL" "$SRC_DIR"
+    qrun git clone --branch "$GIT_REF" --depth 1 "$REPO_URL" "$SRC_DIR"
 fi
 
-log "Building controlplane"
+step "Building controlplane and exit-node binaries"
 mkdir -p "$BIN_DIR"
-( cd "$SRC_DIR/controlplane" && go build -o "$BIN_DIR/controlplane" ./cmd/controlplane )
+( cd "$SRC_DIR/controlplane" && qrun go build -o "$BIN_DIR/controlplane" ./cmd/controlplane )
 
 if [ "${RUN_NODE_HERE:-n}" = "y" ] || [ "${RUN_NODE_HERE:-n}" = "Y" ]; then
-    log "Building the exit-node binary"
-    ( cd "$SRC_DIR" && go build -o "$BIN_DIR/universal-bypass-tool" . )
+    ( cd "$SRC_DIR" && qrun go build -o "$BIN_DIR/universal-bypass-tool" . )
 fi
 
 # Optional: controlplane always serves its own embedded panel at /admin/ regardless (see admin.html).
 WEB_BUN="${WEB_BUN:-}"
 if [ "${WEB_PANEL:-n}" = "y" ] || [ "${WEB_PANEL:-n}" = "Y" ]; then
-    log "Setting up Bun (for the SvelteKit web panel)"
+    step "Setting up the web panel (Bun + SvelteKit build)"
     BUN_INSTALL_DIR="$INSTALL_ROOT/bun"
     if [ -x "$BUN_INSTALL_DIR/bin/bun" ]; then
         WEB_BUN="$BUN_INSTALL_DIR/bin/bun"
@@ -390,7 +421,7 @@ if [ "${WEB_PANEL:-n}" = "y" ] || [ "${WEB_PANEL:-n}" = "Y" ]; then
     fi
     if [ -z "$WEB_BUN" ]; then
         # export inside (...) scopes BUN_INSTALL to bun's own install pipeline without leaking it further.
-        if (export BUN_INSTALL="$BUN_INSTALL_DIR"; curl -fsSL https://bun.sh/install | bash) &&
+        if (export BUN_INSTALL="$BUN_INSTALL_DIR"; qrun sh -c 'curl -fsSL https://bun.sh/install | bash') &&
             [ -x "$BUN_INSTALL_DIR/bin/bun" ]; then
             WEB_BUN="$BUN_INSTALL_DIR/bin/bun"
         else
@@ -408,8 +439,8 @@ if [ "${WEB_PANEL:-n}" = "y" ] || [ "${WEB_PANEL:-n}" = "Y" ]; then
     WEB_DIR_OLD="$WEB_DIR.old"
     rm -rf "$WEB_DIR_NEW"
     if ( cd "$SRC_DIR/controlplane/web" \
-        && "$WEB_BUN" install \
-        && "$WEB_BUN" run build \
+        && qrun "$WEB_BUN" install \
+        && qrun "$WEB_BUN" run build \
         && mkdir -p "$WEB_DIR_NEW" \
         && cp -a build "$WEB_DIR_NEW/" \
         && cp -a node_modules "$WEB_DIR_NEW/" \
@@ -453,8 +484,8 @@ if [ "$OS_FAMILY" = "rhel" ]; then
         sed -i -E 's/^(host +all +all +127\.0\.0\.1\/32 +)ident/\1scram-sha-256/' "$PG_DATADIR/pg_hba.conf"
         sed -i -E 's/^(host +all +all +::1\/128 +)ident/\1scram-sha-256/' "$PG_DATADIR/pg_hba.conf"
     fi
-    systemctl enable --now postgresql
-    systemctl reload postgresql 2>/dev/null || systemctl restart postgresql
+    qrun systemctl enable --now postgresql
+    qrun systemctl reload postgresql 2>/dev/null || qrun systemctl restart postgresql
 fi
 DB_NAME="openflux"
 DB_USER="openflux"
@@ -479,7 +510,8 @@ if [ -z "$WEB_PORT" ]; then
 fi
 WEB_PORT="${WEB_PORT:-3000}"
 # 3000 is also Forgejo/Gitea's default port - walk forward to the next free one instead of crash-looping.
-while ss -tln 2>/dev/null | grep -q ":$WEB_PORT "; do
+# Also skips ports browsers refuse to open (same blocked list as HTTPS_PORT above).
+while ss -tln 2>/dev/null | grep -q ":$WEB_PORT " || is_browser_blocked_port "$WEB_PORT"; do
     WEB_PORT=$((WEB_PORT + 1))
 done
 if [ "$TLS_MODE" = "http" ]; then
@@ -520,7 +552,7 @@ EOF
 fi
 
 # Templates are inlined, not read from a sibling file - both `curl -o install.sh` and the app's SSH deployer fetch only this one file.
-log "Installing the systemd service"
+step "Starting services"
 sed "s#/opt/openflux#$INSTALL_ROOT#g" <<'SERVICE_TEMPLATE' > "/etc/systemd/system/$SERVICE_NAME.service"
 [Unit]
 Description=OpenFlux control plane
@@ -594,12 +626,12 @@ curl -fsS "http://127.0.0.1:$CONTROLPLANE_PORT/healthz" >/dev/null 2>&1 || die "
 
 if [ "$TLS_MODE" != "http" ]; then
 
-log "Configuring Nginx"
+step "Configuring Nginx and TLS"
 # SELinux (RHEL-family) blocks Nginx from proxying out by default - without this every proxy_pass below would 502.
 if [ "$OS_FAMILY" = "rhel" ] && command -v setsebool >/dev/null 2>&1; then
     setsebool -P httpd_can_network_connect 1 2>/dev/null || true
 fi
-systemctl enable --now nginx
+qrun systemctl enable --now nginx
 mkdir -p /var/www/certbot /etc/nginx/conf.d
 # Shared by both vhost templates below; routes /admin/ to the web panel (if any), everything else to controlplane.
 write_web_locations() {
@@ -710,8 +742,8 @@ server {
 }
 NGINX_HTTPS_TEMPLATE
     fi
-    nginx -t
-    systemctl reload nginx 2>/dev/null || systemctl restart nginx
+    qrun nginx -t
+    qrun systemctl reload nginx 2>/dev/null || qrun systemctl restart nginx
 }
 
 if [ "${RESERVE_PORT_80:-n}" = "y" ] || [ "${RESERVE_PORT_80:-n}" = "Y" ]; then
@@ -743,22 +775,22 @@ server {
     include __NGINX_LOCATIONS_FILE__;
 }
 NGINX_INITIAL_TEMPLATE
-nginx -t
-systemctl reload nginx 2>/dev/null || systemctl restart nginx
+qrun nginx -t
+qrun systemctl reload nginx 2>/dev/null || qrun systemctl restart nginx
 
 # Domain mode uses certbot's --nginx plugin; IP mode uses its short-lived-IP-cert capability, hand-installed via write_https_nginx_config.
 obtain_tls() {
     if [ "$TLS_MODE" = "domain" ]; then
         local https_port_flag=""
         [ "$HTTPS_PORT" = "443" ] || https_port_flag="--https-port $HTTPS_PORT"
-        certbot --nginx --non-interactive --agree-tos -m "$LE_EMAIL" -d "$SERVER_NAME" --redirect $https_port_flag
+        qrun certbot --nginx --non-interactive --agree-tos -m "$LE_EMAIL" -d "$SERVER_NAME" --redirect $https_port_flag
         return $?
     fi
 
     log "Attempting Let's Encrypt short-lived certificate for IP $SERVER_NAME"
     # ACME rejects a made-up address under .invalid, so fall back to a random mailbox on a real domain instead.
     local ip_mode_email="${LE_EMAIL:-$(openssl rand -hex 6)@helloo.lol}"
-    if certbot certonly --webroot --webroot-path /var/www/certbot --non-interactive --agree-tos \
+    if qrun certbot certonly --webroot --webroot-path /var/www/certbot --non-interactive --agree-tos \
         -m "$ip_mode_email" \
         --preferred-profile shortlived --ip-address "$SERVER_NAME"; then
         write_https_nginx_config "/etc/letsencrypt/live/$SERVER_NAME/fullchain.pem" \
@@ -809,14 +841,14 @@ if [ "${REGISTER_NODE:-n}" = "y" ] || [ "${REGISTER_NODE:-n}" = "Y" ]; then
         log "Node \"$NODE_NAME\" is already registered - leaving it as is"
         # A node's token is one-way hashed, same as any other - a redeploy can only reuse a previously saved copy.
         NODE_TOKEN="${NODE_TOKEN:-$(read_existing_env NODEAGENT_TOKEN "$NODEAGENT_ENV_FILE")}"
-        NODE_ID="$(printf '%s' "$EXISTING_NODES" | grep -o "\"ID\":\"[^\"]*\",\"Name\":\"$NODE_NAME\"" | grep -o '"ID":"[^"]*"' | cut -d'"' -f4 | head -n1)"
+        NODE_ID="$(printf '%s' "$EXISTING_NODES" | grep -o "\"ID\":\"[^\"]*\",\"Name\":\"$NODE_NAME\"" | grep -o '"ID":"[^"]*"' | cut -d'"' -f4 | head -n1 || true)"
         if [ -z "$NODE_TOKEN" ]; then
             warn "Its token was only shown once, at creation, and isn't saved on this" \
                  "server either - use the admin panel's \"rotate token\" button, then" \
                  "re-run with NODE_TOKEN=<that token> bash install.sh"
         fi
     else
-        log "Registering the first exit node"
+        step "Registering the exit node"
         NODE_JSON="$(curl -fsS -X POST "http://127.0.0.1:$CONTROLPLANE_PORT/v1/admin/nodes" \
             -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
             -d "{\"name\":\"$NODE_NAME\",\"max_keys\":$NODE_MAX_KEYS}")" || warn "Node registration failed - you can create one later from the admin panel."
@@ -843,11 +875,10 @@ if { [ "${RUN_NODE_HERE:-n}" = "y" ] || [ "${RUN_NODE_HERE:-n}" = "Y" ]; } && [ 
     # Auto-recovered like CONTROLPLANE_PORT, so tuning this once (env var or by hand in the file) survives a redeploy.
     NODE_PORT_RANGE_SIZE="${NODE_PORT_RANGE_SIZE:-$(read_existing_env NODEAGENT_PORT_RANGE_SIZE "$NODEAGENT_ENV_FILE")}"
     NODE_PORT_RANGE_SIZE="${NODE_PORT_RANGE_SIZE:-96}"
-    if [ "${ENABLE_HEADLESS_CAPTCHA:-n}" = "y" ] || [ "${ENABLE_HEADLESS_CAPTCHA:-n}" = "Y" ]; then
-        NODE_CAPTCHA_SOLVE_MODE="headless_browser"
-    else
-        NODE_CAPTCHA_SOLVE_MODE="off"
-    fi
+    # Headless-Chromium CAPTCHA solving was removed - keep a previous install's
+    # value so redeploys don't silently change behaviour, default to off.
+    NODE_CAPTCHA_SOLVE_MODE="$(read_existing_env NODEAGENT_CAPTCHA_SOLVE_MODE "$NODEAGENT_ENV_FILE")"
+    [ "$NODE_CAPTCHA_SOLVE_MODE" = "headless_browser" ] || NODE_CAPTCHA_SOLVE_MODE="off"
     cat > "$NODEAGENT_ENV_FILE" <<EOF
 NODEAGENT_CONTROL_URL=http://127.0.0.1:$CONTROLPLANE_PORT
 NODEAGENT_TOKEN=$NODE_TOKEN
@@ -895,7 +926,7 @@ NODEAGENT_SERVICE_TEMPLATE
 fi
 
 PANEL_URL="$CONTROLPLANE_PUBLIC_URL/admin/"
-log "Done"
+log "Done (100%) - full install log: $LOG_FILE"
 cat <<SUMMARY
 
   Panel URL:     $PANEL_URL
