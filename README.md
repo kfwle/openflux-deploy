@@ -15,8 +15,10 @@ Run it **directly on the target VPS**, as root:
 ```bash
 curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/install.sh | sudo bash
 ```
-```bash
+For uninstall run it:
 
+```bash
+curl -fsSL https://raw.githubusercontent.com/kfwle/openflux-deploy/main/usinstall.sh | sudo bash
 ```
 (Not orchestrated remotely over SSH from your own machine - simpler and more robust to just run it
 where it's actually provisioning things.)
