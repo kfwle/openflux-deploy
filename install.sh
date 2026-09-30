@@ -178,7 +178,7 @@ ask GIT_REF "Git branch/tag to deploy" "main"
 # revert a manually-picked port back to 8080.
 CONTROLPLANE_PORT="${CONTROLPLANE_PORT:-}"
 if [ -z "$CONTROLPLANE_PORT" ]; then
-    CONTROLPLANE_PORT="$(read_existing_env CONTROLPLANE_LISTEN_ADDR | grep -o '[0-9]*$')"
+    CONTROLPLANE_PORT="$(read_existing_env CONTROLPLANE_LISTEN_ADDR | grep -o '[0-9]*$' || true)"
 fi
 CONTROLPLANE_PORT="${CONTROLPLANE_PORT:-8080}"
 
@@ -475,7 +475,7 @@ mkdir -p "$(dirname "$ENV_FILE")"
 WEB_HOST="127.0.0.1"
 WEB_PORT="${WEB_PORT:-}"
 if [ -z "$WEB_PORT" ]; then
-    WEB_PORT="$(read_existing_env CONTROLPLANE_WEB_PORT "$WEB_ENV_FILE" | grep -o '[0-9]*$')"
+    WEB_PORT="$(read_existing_env CONTROLPLANE_WEB_PORT "$WEB_ENV_FILE" | grep -o '[0-9]*$' || true)"
 fi
 WEB_PORT="${WEB_PORT:-3000}"
 # 3000 is also Forgejo/Gitea's default port - walk forward to the next free one instead of crash-looping.
@@ -821,8 +821,8 @@ if [ "${REGISTER_NODE:-n}" = "y" ] || [ "${REGISTER_NODE:-n}" = "Y" ]; then
             -H "Authorization: Bearer $ADMIN_TOKEN" -H 'Content-Type: application/json' \
             -d "{\"name\":\"$NODE_NAME\",\"max_keys\":$NODE_MAX_KEYS}")" || warn "Node registration failed - you can create one later from the admin panel."
         if [ -n "${NODE_JSON:-}" ]; then
-            NODE_TOKEN="$(printf '%s' "$NODE_JSON" | grep -o '"token":"[^"]*"' | cut -d'"' -f4)"
-            NODE_ID="$(printf '%s' "$NODE_JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4)"
+            NODE_TOKEN="$(printf '%s' "$NODE_JSON" | grep -o '"token":"[^"]*"' | cut -d'"' -f4 || true)"
+            NODE_ID="$(printf '%s' "$NODE_JSON" | grep -o '"id":"[^"]*"' | cut -d'"' -f4 || true)"
         fi
     fi
 fi
